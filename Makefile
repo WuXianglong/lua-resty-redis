@@ -1,8 +1,8 @@
 OPENRESTY_PREFIX=/usr/local/openresty-debug
 
-PREFIX ?=          /usr/local
+PREFIX ?=          /usr/local/share
 LUA_INCLUDE_DIR ?= $(PREFIX)/include
-LUA_LIB_DIR ?=     $(PREFIX)/lib/lua/$(LUA_VERSION)
+LUA_LIB_DIR ?=     $(PREFIX)/lua/5.1
 INSTALL ?= install
 
 .PHONY: all test install
@@ -15,4 +15,3 @@ install: all
 
 test: all
 	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH prove -I../test-nginx/lib -r t
-
