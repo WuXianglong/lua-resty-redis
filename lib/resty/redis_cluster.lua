@@ -1,5 +1,6 @@
 local redis = require "resty.redis"
 local bit = require "bit"
+local cjson = require "cjson"
 
 local setmetatable = setmetatable
 local pairs = pairs
@@ -229,6 +230,22 @@ function _M.initialize(self)
     end
 end
 
+function _M.serialize(self)
+    local cluster = clusters[self.cluster_id]
+    if cluster then
+        return cjson.encode(cluster)
+    else
+        return nil
+    end
+end
+
+function _M.deserialize(self, cluster_id, serialized_data)
+    if clusters[cluster_id] == nil then
+        clusters[cluster_id] = cjson.decode(serialized_data)
+    end
+    return setmetatable({ cluster_id = cluster_id }, mt)
+end
+
 function _M.populate_startup_nodes(self)
     local cluster = clusters[self.cluster_id]
 
@@ -253,7 +270,6 @@ function _M.populate_startup_nodes(self)
         unique_nodes[startup_node[3]] = startup_node
     end
 
-    
     for i = 1, nodes_count do
         local node = nodes[i]
         unique_nodes[node[3]] = node
@@ -385,7 +401,7 @@ function _M.send_cluster_command(self, cmd, ...)
 
             local addr = { node_ip_port[1], tonumber(node_ip_port[2]), err_split[3]}
 
-            cluster.slots[newslot] = addr 
+            cluster.slots[newslot] = addr
         else
             try_random_node = true
         end
