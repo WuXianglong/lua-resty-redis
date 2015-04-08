@@ -1,6 +1,5 @@
 local redis = require "resty.redis"
 local bit = require "bit"
-local cjson = require "cjson"
 
 local setmetatable = setmetatable
 local pairs = pairs
@@ -13,7 +12,7 @@ local tonumber = tonumber
 
 
 local ok, new_tab = pcall(require, "table.new")
-if not ok then
+if not ok or type(new_tab) ~= "function" then
     new_tab = function (narr, nrec) return {} end
 end
 
@@ -86,6 +85,8 @@ local function crc16(str)
 end
 
 local clusters = new_tab(0, 20)
+-- use shared dict to store slot info, TODO: customize the dict name
+local cluster_business = ngx.shared.cluster_business
 
 local function get_redis_link(host, port, timeout)
     local r = redis:new()
@@ -135,14 +136,11 @@ function _M.new(self, cluster_id, startup_nodes, opt)
         
         clusters[cluster_id] = {
             startup_nodes = startup_nodes,
-            nodes = nil,
-            slots = nil,
             timeout = (opt and opt.timeout) and opt.timeout or REDIS_CLUSTER_DEFAULT_TIMEOUT,
             keepalive_size = (opt and opt.keepalive_size) and opt.keepalive_size or REDIS_CLUSTER_DEFAULT_KEEPALIVE_SIZE,
             keepalive_duration = (opt and opt.keepalive_duration) and opt.keepalive_duration or REDIS_CLUSTER_DEFAULT_KEEPALIVE_DURATION,
             ttl = (opt and opt.ttl) and opt.ttl or REDIS_CLUSTER_REQUEST_TTL,
-            refresh_table_asap = false,
-            initialized = false
+            refresh_table_asap = false
         }
     end
 
@@ -170,9 +168,8 @@ function _M.initialize(self)
         local r = get_redis_link(node[1], node[2], cluster.timeout)
         local results, err = r:cluster("nodes")
 
-        cluster.nodes = new_tab(500, 0)
-        cluster.slots = new_tab(REDIS_CLUSTER_HASH_SLOTS, 0)
-        
+        local nodes = new_tab(500, 0)
+
         if results then
             local lines = string_split(results, char(10), 1000)
             for line_index = 1, #lines do
@@ -192,9 +189,7 @@ function _M.initialize(self)
                                  tonumber(host_port[2]), 
                                  addr_str }
                     end
-                    cluster.nodes[#(cluster.nodes) + 1] = addr
-                    
-                    local cluster_slots = cluster.slots
+                    nodes[#nodes + 1] = addr
 
                     for slot_index = 9, #fields do
                         local slot = fields[slot_index]
@@ -212,16 +207,19 @@ function _M.initialize(self)
                             end
 
                             for ind = first + 1, last + 1 do
-                                cluster_slots[ind] = addr
+                                -- save slot info into nginx shared dict
+                                cluster_business:set(tostring(ind) .. "_host", addr[1])
+                                cluster_business:set(tostring(ind) .. "_port", addr[2])
                             end
                         end
                     end
                 end
             end
 
-            self:populate_startup_nodes()
-            cluster.initialized = true
+            self:populate_startup_nodes(nodes)
             cluster.refresh_table_asap = false
+            -- set initialized key
+            cluster_business:set("initialized", true)
             r:set_keepalive(cluster.keepalive_duration, cluster.keepalive_size)
             break
         else
@@ -230,32 +228,14 @@ function _M.initialize(self)
     end
 end
 
-function _M.serialize(self)
-    local cluster = clusters[self.cluster_id]
-    if cluster then
-        return cjson.encode(cluster)
-    else
-        return nil
-    end
-end
-
-function _M.deserialize(self, cluster_id, serialized_data)
-    if clusters[cluster_id] == nil then
-        clusters[cluster_id] = cjson.decode(serialized_data)
-    end
-    return setmetatable({ cluster_id = cluster_id }, mt)
-end
-
-function _M.populate_startup_nodes(self)
+function _M.populate_startup_nodes(self, nodes)
     local cluster = clusters[self.cluster_id]
 
     if cluster == nil or cluster.startup_nodes == nil then
         return nil
     end
-    
-    local startup_nodes = cluster.startup_nodes
-    local nodes = cluster.nodes
 
+    local startup_nodes = cluster.startup_nodes
     local startup_nodes_count = #startup_nodes
     local nodes_count = #nodes
 
@@ -284,7 +264,8 @@ function _M.populate_startup_nodes(self)
 end
 
 function _M.flush_slots_cache(self)
-    clusters[self.cluster_id].slots = nil
+    cluster_business:flush_all()
+    cluster_business:flush_expired()
 end
 
 function _M.keyslot(self, key)
@@ -323,21 +304,18 @@ end
 
 function _M.get_connection_by_slot(self, slot)
     local cluster = clusters[self.cluster_id]
-    local node = cluster.slots[slot]
+    local host = cluster_business:get(tostring(slot) .. "_host")
+    local port = cluster_business:get(tostring(slot) .. "_port")
 
-    if node == nil then
+    if host == nil or port == nil then
         return self:get_random_connection()
     end
 
-    return get_redis_link(node[1], node[2], cluster.timeout)
+    return get_redis_link(host, port, cluster.timeout)
 end
 
 function _M.send_cluster_command(self, cmd, ...)
     local cluster = clusters[self.cluster_id]
-
-    if cluster.initialized == false then
-        return nil, "Uninitialized cluster"
-    end
 
     if cluster.refresh_table_asap == true then
         self:initialize()
@@ -399,9 +377,8 @@ function _M.send_cluster_command(self, cmd, ...)
             local newslot = tonumber(err_split[2]) + 1
             local node_ip_port = string_split(err_split[3], ":")
 
-            local addr = { node_ip_port[1], tonumber(node_ip_port[2]), err_split[3]}
-
-            cluster.slots[newslot] = addr
+            cluster_business:set(tostring(newslot) .. "_host", node_ip_port[1])
+            cluster_business:set(tostring(newslot) .. "_port", tonumber(node_ip_port[2]))
         else
             try_random_node = true
         end
