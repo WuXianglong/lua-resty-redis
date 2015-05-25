@@ -85,16 +85,29 @@ local function crc16(str)
 end
 
 local clusters = new_tab(0, 20)
--- use shared dict to store slot info, TODO: customize the dict name
+-- TODO: use shared dict to store slot info, TODO: customize the dict name
 local cluster_business = ngx.shared.cluster_business
 
-local function get_redis_link(host, port, timeout)
+local function get_redis_link(host, port, timeout, retries)
+    retries = retries or 0
+
     local r = redis:new()
 
     r:set_timeout(timeout)
-    r:connect(host, port)
-
-    return r
+    local ok, err = r:connect(host, port)
+    if err then
+        ngx.log(ngx.ERR, 'connect to ' .. host .. ':' .. port .. '--> '  .. err)
+        if retries < 2 then
+            ngx.sleep(0.1)
+            ngx.log(ngx.ERR, '[#' .. retries ..  ']reconnect to ' .. host .. ':' .. port)
+            return get_redis_link(host, port, timeout, retries+1)
+        else
+            ngx.log(ngx.ERR, 'attempts exhuasted--[connect][' .. host .. ':' .. port .. ']')
+            return nil
+        end
+    else
+        return r
+    end
 end
 
 local function set_node_name(n)
@@ -105,26 +118,26 @@ end
 
 local function string_split(str, delim, max)
     if str == nil or delim == nil then
-        return nil 
-    end 
+        return nil
+    end
 
     if max == nil or max <= 0 then
         max = 1000
-    end 
+    end
 
     local t = new_tab(max, 0)
-    local index = 1 
-    local start = 1 
+    local index = 1
+    local start = 1
     for i = 1, max do
         local last, delim_last = find(str, delim, start, true)
         if last == nil or delim_last == nil then
             break
-        end 
+        end
 
         t[i] = sub(str, start, last - 1)
-        start = delim_last + 1 
-        index = i + 1 
-    end 
+        start = delim_last + 1
+        index = i + 1
+    end
     t[index] = sub(str, start)
     return t
 end
@@ -133,7 +146,7 @@ local mt = { __index = _M }
 
 function _M.new(self, cluster_id, startup_nodes, opt)
     if clusters[cluster_id] == nil then
-        
+
         clusters[cluster_id] = {
             startup_nodes = startup_nodes,
             timeout = (opt and opt.timeout) and opt.timeout or REDIS_CLUSTER_DEFAULT_TIMEOUT,
@@ -180,13 +193,13 @@ function _M.initialize(self)
                     local addr = nil
 
                     if addr_str == ":0" then
-                        addr = { node[1], 
-                                 tonumber(node[2]), 
+                        addr = { node[1],
+                                 tonumber(node[2]),
                                  node[1] .. ":" .. tostring(node[2]) }
                     else
                         local host_port = string_split(addr_str, ":", 2)
-                        addr = { host_port[1], 
-                                 tonumber(host_port[2]), 
+                        addr = { host_port[1],
+                                 tonumber(host_port[2]),
                                  addr_str }
                     end
                     nodes[#nodes + 1] = addr
@@ -194,10 +207,10 @@ function _M.initialize(self)
                     for slot_index = 9, #fields do
                         local slot = fields[slot_index]
 
-                        if not slot then 
-                            break 
+                        if not slot then
+                            break
                         end
-                        
+
                         if sub(slot, 1, 1) ~= "[" then
                             local range = string_split(slot, "-", 2)
                             local first = tonumber(range[1])
@@ -240,7 +253,7 @@ function _M.populate_startup_nodes(self, nodes)
     local nodes_count = #nodes
 
     local unique_nodes = new_tab(0, nodes_count + startup_nodes_count)
-    
+
     for i = 1, startup_nodes_count do
         local startup_node = startup_nodes[i]
         if startup_node[3] == nil then
@@ -273,7 +286,7 @@ function _M.keyslot(self, key)
     if s then
         local e = find(key, "}", s+1)
         if e and e ~= s+1 then
-            key = sub(key, s+1, e-1) 
+            key = sub(key, s+1, e-1)
         end
     end
 
@@ -288,7 +301,7 @@ function _M.get_random_connection(self)
     end
 
     local startup_nodes = cluster.startup_nodes
-    
+
     for i = 1, #startup_nodes do
         local node = startup_nodes[i]
         local r = get_redis_link(node[1], node[2], cluster.timeout)
@@ -326,7 +339,7 @@ function _M.send_cluster_command(self, cmd, ...)
     local try_random_node = false
     local argv = {...}
     local last_error = nil
-    
+
     while ttl > 0 do
         ttl = ttl - 1
 
@@ -347,22 +360,28 @@ function _M.send_cluster_command(self, cmd, ...)
             r = self:get_connection_by_slot(slot)
         end
 
+        if r == nil then
+            break
+        end
+
         if asking == true then
             -- TODO: pipeline
             r:asking()
         end
-        
+
         asking = false
 
         local result, err = r[cmd](r, ...)
-        r:set_keepalive(cluster.keepalive_duration, cluster.keepalive_size)
+        if not err then
+            r:set_keepalive(cluster.keepalive_duration, cluster.keepalive_size)
+        end
 
         if err == nil and result ~= nil then
             return result, err
         end
 
         last_error = err
-        
+
         local err_split = string_split(err, " ")
 
         if err_split[1] == "ASK" then
